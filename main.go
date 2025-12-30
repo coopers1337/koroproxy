@@ -68,13 +68,12 @@ func makeRequest(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
 	defer fasthttp.ReleaseRequest(req)
 	req.Header.SetMethod(string(ctx.Method()))
 	url := strings.SplitN(string(ctx.Request.Header.RequestURI())[1:], "/", 2)
-	req.SetRequestURI("https://" + url[0] + ".roblox.com/" + url[1])
+	req.SetRequestURI("https://" + url[0] + ".pekora.zip/" + url[1])
 	req.SetBody(ctx.Request.Body())
 	ctx.Request.Header.VisitAll(func (key, value []byte) {
 		req.Header.Set(string(key), string(value))
 	})
-	req.Header.Set("User-Agent", "RoProxy")
-	req.Header.Del("Roblox-Id")
+	req.Header.Set("User-Agent", "KoroProxy")
 	resp := fasthttp.AcquireResponse()
 
 	err := client.Do(req, resp)
