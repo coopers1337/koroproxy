@@ -59,23 +59,39 @@ func forward(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
 	req.Header.SetMethodBytes(ctx.Method())
 
 	uri := ctx.Request.URI()
-	path := strings.TrimPrefix(string(uri.Path()), "/")
-	parts := strings.SplitN(path, "/", 2)
+	raw := strings.TrimPrefix(string(uri.Path()), "/")
 
-	if len(parts) < 2 {
-		r := fasthttp.AcquireResponse()
-		r.SetStatusCode(400)
-		r.SetBodyString("Invalid URL format.")
-		return r
+	var target string
+	var host string
+
+	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
+		target = raw
+	} else {
+		parts := strings.SplitN(raw, "/", 2)
+		if len(parts) < 2 {
+			r := fasthttp.AcquireResponse()
+			r.SetStatusCode(400)
+			r.SetBodyString("Invalid URL format.")
+			return r
+		}
+
+		if strings.Contains(parts[0], ".") {
+			target = "https://" + raw
+		} else {
+			target = "https://" + parts[0] + ".pekora.zip/" + parts[1]
+		}
 	}
 
-	target := "https://" + parts[0] + ".pekora.zip/" + parts[1]
-	if len(uri.QueryString()) > 0 {
+	if len(uri.QueryString()) > 0 && !strings.Contains(target, "?") {
 		target += "?" + string(uri.QueryString())
 	}
 
 	req.SetRequestURI(target)
 	req.SetBody(ctx.Request.Body())
+
+	if u := strings.Split(strings.TrimPrefix(strings.TrimPrefix(target, "https://"), "http://"), "/"); len(u) > 0 {
+		host = u[0]
+	}
 
 	ctx.Request.Header.VisitAll(func(k, v []byte) {
 		h := strings.ToLower(string(k))
@@ -85,7 +101,7 @@ func forward(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
 		req.Header.SetBytesKV(k, v)
 	})
 
-	req.Header.Set("Host", parts[0]+".pekora.zip")
+	req.Header.Set("Host", host)
 	req.Header.Set("User-Agent", "KoroProxy")
 	req.Header.Set("x-csrf-token", "KoroProxy")
 
