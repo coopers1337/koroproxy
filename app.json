@@ -1,7 +1,7 @@
 {
-    "name": "RoProxy Lite",
-    "description": "A modified version of RoProxy made for self-hosting.",
-    "repository": "https://github.com/halffalse/roproxy-lite",
+    "name": "KoroProxy Lite",
+    "description": "A korone.zip (pekora.zip) version of RoProxy.",
+    "repository": "https://github.com/coopers1337/koroproxy",
     "env": {
         "KEY": {
             "description": "The key used to access proxy.",
