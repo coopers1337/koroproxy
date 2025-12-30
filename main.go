@@ -62,26 +62,11 @@ func forward(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
 	raw := strings.TrimPrefix(string(uri.Path()), "/")
 
 	var target string
-	var host string
 
 	if strings.HasPrefix(raw, "http://") || strings.HasPrefix(raw, "https://") {
 		target = raw
-	} else if strings.HasPrefix(raw, "apisite/") {
-		target = "https://apisite.pekora.zip/" + strings.TrimPrefix(raw, "apisite/")
 	} else {
-		parts := strings.SplitN(raw, "/", 2)
-		if len(parts) < 2 {
-			r := fasthttp.AcquireResponse()
-			r.SetStatusCode(400)
-			r.SetBodyString("Invalid URL format.")
-			return r
-		}
-
-		if strings.Contains(parts[0], ".") {
-			target = "https://" + raw
-		} else {
-			target = "https://" + parts[0] + ".pekora.zip/" + parts[1]
-		}
+		target = "https://www.pekora.zip/" + raw
 	}
 
 	if len(uri.QueryString()) > 0 {
@@ -91,11 +76,6 @@ func forward(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
 	req.SetRequestURI(target)
 	req.SetBody(ctx.Request.Body())
 
-	u := strings.Split(strings.TrimPrefix(strings.TrimPrefix(target, "https://"), "http://"), "/")
-	if len(u) > 0 {
-		host = u[0]
-	}
-
 	ctx.Request.Header.VisitAll(func(k, v []byte) {
 		h := strings.ToLower(string(k))
 		if h == "host" || h == "connection" || h == "content-length" || h == "accept-encoding" {
@@ -104,7 +84,7 @@ func forward(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
 		req.Header.SetBytesKV(k, v)
 	})
 
-	req.Header.Set("Host", host)
+	req.Header.Set("Host", "www.pekora.zip")
 	req.Header.Set("User-Agent", "KoroProxy")
 	req.Header.Set("x-csrf-token", "KoroProxy")
 
