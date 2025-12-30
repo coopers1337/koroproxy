@@ -2,86 +2,98 @@ package main
 
 import (
 	"log"
-	"time"
 	"os"
-	"github.com/valyala/fasthttp"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/valyala/fasthttp"
 )
 
 var timeout, _ = strconv.Atoi(os.Getenv("TIMEOUT"))
 var retries, _ = strconv.Atoi(os.Getenv("RETRIES"))
 var port = os.Getenv("PORT")
-
 var client *fasthttp.Client
 
 func main() {
-	h := requestHandler
-	
 	client = &fasthttp.Client{
 		ReadTimeout: time.Duration(timeout) * time.Second,
 		MaxIdleConnDuration: 60 * time.Second,
 	}
 
-	if err := fasthttp.ListenAndServe(":" + port, h); err != nil {
-		log.Fatalf("Error in ListenAndServe: %s", err)
+	if err := fasthttp.ListenAndServe(":"+port, handler); err != nil {
+		log.Fatal(err)
 	}
 }
 
-func requestHandler(ctx *fasthttp.RequestCtx) {
-	val, ok := os.LookupEnv("KEY")
-
-	if ok && string(ctx.Request.Header.Peek("PROXYKEY")) != val {
-		ctx.SetStatusCode(407)
-		ctx.SetBody([]byte("Missing or invalid PROXYKEY header."))
-		return
+func handler(ctx *fasthttp.RequestCtx) {
+	if key, ok := os.LookupEnv("KEY"); ok {
+		if string(ctx.Request.Header.Peek("PROXYKEY")) != key {
+			ctx.SetStatusCode(407)
+			ctx.SetBodyString("Missing or invalid PROXYKEY header.")
+			return
+		}
 	}
 
-	if len(strings.SplitN(string(ctx.Request.Header.RequestURI())[1:], "/", 2)) < 2 {
-		ctx.SetStatusCode(400)
-		ctx.SetBody([]byte("URL format invalid."))
-		return
-	}
+	resp := forward(ctx, 1)
+	defer fasthttp.ReleaseResponse(resp)
 
-	response := makeRequest(ctx, 1)
-
-	defer fasthttp.ReleaseResponse(response)
-
-	body := response.Body()
-	ctx.SetBody(body)
-	ctx.SetStatusCode(response.StatusCode())
-	response.Header.VisitAll(func (key, value []byte) {
-		ctx.Response.Header.Set(string(key), string(value))
+	ctx.SetStatusCode(resp.StatusCode())
+	ctx.SetBody(resp.Body())
+	resp.Header.VisitAll(func(k, v []byte) {
+		ctx.Response.Header.SetBytesKV(k, v)
 	})
 }
 
-func makeRequest(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
+func forward(ctx *fasthttp.RequestCtx, attempt int) *fasthttp.Response {
 	if attempt > retries {
-		resp := fasthttp.AcquireResponse()
-		resp.SetBody([]byte("Proxy failed to connect. Please try again."))
-		resp.SetStatusCode(500)
-
-		return resp
+		r := fasthttp.AcquireResponse()
+		r.SetStatusCode(502)
+		r.SetBodyString("Proxy failed to connect.")
+		return r
 	}
 
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
-	req.Header.SetMethod(string(ctx.Method()))
-	url := strings.SplitN(string(ctx.Request.Header.RequestURI())[1:], "/", 2)
-	req.SetRequestURI("https://" + url[0] + ".pekora.zip/" + url[1])
-	req.SetBody(ctx.Request.Body())
-	ctx.Request.Header.VisitAll(func (key, value []byte) {
-		req.Header.Set(string(key), string(value))
-	})
-	req.Header.Set("User-Agent", "KoroProxy")
-	resp := fasthttp.AcquireResponse()
 
-	err := client.Do(req, resp)
+	req.Header.SetMethodBytes(ctx.Method())
 
-    if err != nil {
-		fasthttp.ReleaseResponse(resp)
-        return makeRequest(ctx, attempt + 1)
-    } else {
-		return resp
+	uri := ctx.Request.URI()
+	path := strings.TrimPrefix(string(uri.Path()), "/")
+	parts := strings.SplitN(path, "/", 2)
+
+	if len(parts) < 2 {
+		r := fasthttp.AcquireResponse()
+		r.SetStatusCode(400)
+		r.SetBodyString("Invalid URL format.")
+		return r
 	}
+
+	target := "https://" + parts[0] + ".pekora.zip/" + parts[1]
+	if len(uri.QueryString()) > 0 {
+		target += "?" + string(uri.QueryString())
+	}
+
+	req.SetRequestURI(target)
+	req.SetBody(ctx.Request.Body())
+
+	ctx.Request.Header.VisitAll(func(k, v []byte) {
+		h := strings.ToLower(string(k))
+		if h == "host" || h == "connection" || h == "content-length" || h == "accept-encoding" {
+			return
+		}
+		req.Header.SetBytesKV(k, v)
+	})
+
+	req.Header.Set("Host", parts[0]+".pekora.zip")
+	req.Header.Set("User-Agent", "KoroProxy")
+	req.Header.Set("x-csrf-token", "KoroProxy")
+
+	resp := fasthttp.AcquireResponse()
+	if err := client.Do(req, resp); err != nil {
+		fasthttp.ReleaseResponse(resp)
+		return forward(ctx, attempt+1)
+	}
+
+	return resp
 }
