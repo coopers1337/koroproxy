@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -10,17 +11,22 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+const (
+	userAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+	baseTarget = "https://www.pekora.zip"
+)
 
 var (
 	key     string
 	timeout time.Duration
 	retries int
 	client  *fasthttp.Client
+	host    string // e.g. "koroneproxy.up.railway.app"
 )
 
 func main() {
 	key = os.Getenv("KEY")
+	host = os.Getenv("HOST") // set this in Railway: koroneproxy.up.railway.app
 
 	t, _ := strconv.Atoi(os.Getenv("TIMEOUT"))
 	if t <= 0 {
@@ -53,6 +59,47 @@ func main() {
 	}
 }
 
+func resolveTarget(ctx *fasthttp.RequestCtx) string {
+	path := string(ctx.Path())
+	reqHost := string(ctx.Host())
+	qs := string(ctx.QueryArgs().QueryString())
+
+	// Format 3: subdomain.koroneproxy.up.railway.app/path
+	// e.g. users.koroneproxy.up.railway.app/v1/users/1
+	if host != "" && strings.HasSuffix(reqHost, "."+host) {
+		subdomain := strings.TrimSuffix(reqHost, "."+host)
+		target := fmt.Sprintf("https://%s.pekora.zip%s", subdomain, path)
+		if qs != "" {
+			target += "?" + qs
+		}
+		return target
+	}
+
+	// Format 2: /https://www.pekora.zip/apisite/...
+	// or /https://users.pekora.zip/v1/...
+	if strings.HasPrefix(path, "/https://") || strings.HasPrefix(path, "/http://") {
+		raw := strings.TrimPrefix(path, "/")
+		parsed, err := url.Parse(raw)
+		if err == nil {
+			target := parsed.Scheme + "://" + parsed.Host + parsed.Path
+			if qs != "" {
+				target += "?" + qs
+			} else if parsed.RawQuery != "" {
+				target += "?" + parsed.RawQuery
+			}
+			return target
+		}
+	}
+
+	// Format 1: /apisite/catalog/v1/...  or any path
+	// → https://www.pekora.zip/apisite/catalog/v1/...
+	target := baseTarget + path
+	if qs != "" {
+		target += "?" + qs
+	}
+	return target
+}
+
 func handler(ctx *fasthttp.RequestCtx) {
 	path := string(ctx.Path())
 
@@ -73,30 +120,10 @@ func handler(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	// parse /{subdomain}/{rest...}
-	trimmed := strings.TrimPrefix(path, "/")
-	if trimmed == "" {
-		jsonError(ctx, 404, "Not Found")
-		return
-	}
+	// resolve target URL from any of the 3 formats
+	targetURL := resolveTarget(ctx)
 
-	parts := strings.SplitN(trimmed, "/", 2)
-	subdomain := parts[0]
-	rest := ""
-	if len(parts) > 1 {
-		rest = parts[1]
-	}
-
-	if subdomain == "" {
-		jsonError(ctx, 404, "Not Found")
-		return
-	}
-
-	// build target url
-	targetURL := fmt.Sprintf("https://%s.pekora.zip/%s", subdomain, rest)
-	if qs := string(ctx.QueryArgs().QueryString()); qs != "" {
-		targetURL += "?" + qs
-	}
+	fmt.Printf("[PROXY] %s %s → %s\n", string(ctx.Method()), path, targetURL)
 
 	// user cookies from client
 	userCookie := string(ctx.Request.Header.Peek("Cookie"))
@@ -120,8 +147,13 @@ func handler(ctx *fasthttp.RequestCtx) {
 
 		req.SetRequestURI(targetURL)
 		req.Header.SetMethod(string(ctx.Method()))
-		req.Header.Set("Host", fmt.Sprintf("%s.pekora.zip", subdomain))
 		req.Header.Set("User-Agent", userAgent)
+
+		// set host header correctly based on target
+		parsed, err := url.Parse(targetURL)
+		if err == nil {
+			req.Header.Set("Host", parsed.Host)
+		}
 
 		// copy client headers — skip ones we manage manually
 		ctx.Request.Header.VisitAll(func(k, v []byte) {
@@ -152,18 +184,19 @@ func handler(ctx *fasthttp.RequestCtx) {
 			req.SetBody(body)
 		}
 
-		err := client.DoTimeout(req, resp, timeout)
+		err = client.DoTimeout(req, resp, timeout)
 		if err != nil {
 			lastErr = err
+			fmt.Printf("[ERROR] attempt %d: %s → %s\n", i+1, targetURL, err.Error())
 			fasthttp.ReleaseRequest(req)
 			fasthttp.ReleaseResponse(resp)
 			continue
 		}
 
 		status := resp.StatusCode()
+		fmt.Printf("[RESP] %d %s\n", status, targetURL)
 
 		// 403 = CSRF rejected
-		// upstream sends: x-csrf-token header + Set-Cookie: rbxcsrf4=<JWT>
 		if status == 403 {
 			newCSRF := string(resp.Header.Peek("x-csrf-token"))
 			newRbxcsrf4 := findSetCookie(resp, "rbxcsrf4")
@@ -183,7 +216,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 		location := string(resp.Header.Peek("Location"))
 		contentType := string(resp.Header.Peek("Content-Type"))
 
-		// block redirects
+		// block redirects to pekora.zip / roblox.com
 		if status >= 300 && status < 400 {
 			if strings.Contains(location, "pekora.zip") ||
 				strings.Contains(location, "roblox.com") {
@@ -219,7 +252,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 			if lo == "transfer-encoding" ||
 				lo == "connection" ||
 				lo == "set-cookie" {
-				return // handle set-cookie separately below
+				return
 			}
 			ctx.Response.Header.AddBytesKV(k, v)
 		})
@@ -229,8 +262,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 			ctx.Response.Header.Set("x-csrf-token", v)
 		}
 
-		// forward Set-Cookie headers back to client properly
-		// VisitAllCookie gives k=cookieName, v=cookieValue (already parsed)
+		// forward Set-Cookie headers back to client
 		resp.Header.VisitAllCookie(func(k, v []byte) {
 			ctx.Response.Header.Add("Set-Cookie", string(k)+"="+string(v))
 		})
@@ -270,7 +302,6 @@ func preflight(targetURL string, cookie string) (csrfToken string, rbxcsrf4 stri
 
 	csrfToken = string(resp.Header.Peek("x-csrf-token"))
 	rbxcsrf4 = findSetCookie(resp, "rbxcsrf4")
-
 	return csrfToken, rbxcsrf4
 }
 
@@ -299,7 +330,7 @@ func mergeCookies(existing string, name string, value string) string {
 				continue
 			}
 			if strings.HasPrefix(trimmed, name+"=") {
-				continue // drop old one
+				continue
 			}
 			parts = append(parts, trimmed)
 		}
