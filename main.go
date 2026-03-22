@@ -142,6 +142,11 @@ func resolveTargetURL(rawURI string) (string, bool) {
 //   - 404 redirect to https://www.pekora.zip/
 func requestHandler(ctx *fasthttp.RequestCtx) {
 	// --- Authentication ---
+	if string(ctx.Path()) == "/healthz" {
+    ctx.SetStatusCode(200)
+    ctx.SetBody([]byte("ok"))
+    return
+    } 
 	val, ok := os.LookupEnv("KEY")
 	if ok && val != "" && string(ctx.Request.Header.Peek("PROXYKEY")) != val {
 		ctx.SetStatusCode(407)
