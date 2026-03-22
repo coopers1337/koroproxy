@@ -25,6 +25,38 @@ const (
 	redirectTarget = "https://www.pekora.zip/"
 )
 
+// knownSubdomains is the list of known pekora.zip subdomains.
+// If the first path segment matches one of these, it will be used
+// as a subdomain. Otherwise the full path goes to www.pekora.zip.
+var knownSubdomains = map[string]bool{
+	"apis":            true,
+	"assetgame":       true,
+	"economy":         true,
+	"auth":            true,
+	"catalog":         true,
+	"inventory":       true,
+	"friends":         true,
+	"thumbnails":      true,
+	"games":           true,
+	"users":           true,
+	"presence":        true,
+	"chat":            true,
+	"contacts":        true,
+	"groups":          true,
+	"badges":          true,
+	"avatar":          true,
+	"develop":         true,
+	"forums":          true,
+	"locale":          true,
+	"metrics":         true,
+	"notifications":   true,
+	"points":          true,
+	"premiumfeatures": true,
+	"publish":         true,
+	"trades":          true,
+	"www":             true,
+}
+
 func getEnvDefault(key, fallback string) string {
 	if val, ok := os.LookupEnv(key); ok && val != "" {
 		return val
@@ -70,6 +102,8 @@ func resolveTargetURL(rawURI string) (string, bool) {
 
 	pathAfterSlash := rawURI[1:]
 
+	// Format 1: Full URL passed in path
+	// e.g. /https://apis.pekora.zip/v1/something
 	if strings.HasPrefix(pathAfterSlash, "https://") || strings.HasPrefix(pathAfterSlash, "http://") {
 		parsed, err := url.Parse(pathAfterSlash)
 		if err != nil {
@@ -82,8 +116,13 @@ func resolveTargetURL(rawURI string) (string, bool) {
 		return parsed.String(), true
 	}
 
+	// Format 2: Relative path
+	// Check if first segment is a known subdomain
+	// e.g. /apis/v1/something   → https://apis.pekora.zip/v1/something
+	// e.g. /economy/v2/currency → https://economy.pekora.zip/v2/currency
+	// e.g. /apisite/something   → https://www.pekora.zip/apisite/something
 	parts := strings.SplitN(pathAfterSlash, "/", 2)
-	firstSegment := parts[0]
+	firstSegment := strings.ToLower(parts[0])
 	remainingPath := ""
 	if len(parts) > 1 {
 		remainingPath = parts[1]
@@ -93,10 +132,15 @@ func resolveTargetURL(rawURI string) (string, bool) {
 		return "", false
 	}
 
-	subdomain := strings.ToLower(firstSegment)
-	host := subdomain + "." + baseDomain
-	targetURL := "https://" + host + "/" + remainingPath
+	if knownSubdomains[firstSegment] {
+		// Known subdomain: use it as subdomain
+		host := firstSegment + "." + baseDomain
+		targetURL := "https://" + host + "/" + remainingPath
+		return targetURL, true
+	}
 
+	// Unknown segment: default to www.pekora.zip with full path
+	targetURL := "https://" + baseHost + "/" + pathAfterSlash
 	return targetURL, true
 }
 
