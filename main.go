@@ -1,8 +1,7 @@
 package main
 
 import (
-	"bytes"
-	"log"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -11,239 +10,318 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-const (
-	baseDomain  = "pekora.zip"
-	defaultHost = "www." + baseDomain
-	originVal   = "https://" + defaultHost
-	refererVal  = originVal + "/"
-	uaVal       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-	acceptVal   = "application/json, text/plain, */*"
-	acceptEnc   = "gzip, deflate, br"
-	acceptLang  = "en-US,en;q=0.9"
-)
+const userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 
 var (
-	maxRetries int
-	proxyKey   []byte
-	client     *fasthttp.Client
+	key     string
+	timeout time.Duration
+	retries int
+	client  *fasthttp.Client
 )
-
-var (
-	bHealthz   = []byte("/healthz")
-	bProxykey  = []byte("proxykey")
-	bHost      = []byte("host")
-	bConn      = []byte("connection")
-	bTE        = []byte("transfer-encoding")
-	bSetCookie = []byte("Set-Cookie")
-)
-
-func env(k, d string) string {
-	if v := os.Getenv(k); v != "" {
-		return v
-	}
-	return d
-}
-
-func isSubdomain(s string) bool {
-	switch s {
-	case "apis", "assetgame", "economy", "auth", "catalog",
-		"inventory", "friends", "thumbnails", "games", "users",
-		"presence", "chat", "contacts", "groups", "badges",
-		"avatar", "develop", "forums", "locale", "metrics",
-		"notifications", "points", "premiumfeatures", "publish",
-		"trades", "www":
-		return true
-	}
-	return false
-}
-
-func resolve(uri string) (target, host string, ok bool) {
-	if len(uri) < 2 {
-		return
-	}
-	p := uri[1:]
-
-	full := false
-	if strings.HasPrefix(p, "https://") {
-		full = true
-	} else if strings.HasPrefix(p, "http://") {
-		p = "https://" + p[7:]
-		full = true
-	}
-
-	if full {
-		a := p[8:]
-		si := strings.IndexByte(a, '/')
-		if si < 0 {
-			si = len(a)
-		}
-		host = a[:si]
-		h := host
-		if ci := strings.LastIndexByte(h, ':'); ci >= 0 {
-			h = h[:ci]
-		}
-		h = strings.ToLower(h)
-		if h != baseDomain && !strings.HasSuffix(h, "."+baseDomain) {
-			host = defaultHost
-			if si < len(a) {
-				return "https://" + host + a[si:], host, true
-			}
-			return "https://" + host + "/", host, true
-		}
-		return p, host, true
-	}
-
-	si := strings.IndexByte(p, '/')
-	var seg, rest string
-	if si >= 0 {
-		seg, rest = strings.ToLower(p[:si]), p[si+1:]
-	} else {
-		seg = strings.ToLower(p)
-	}
-	if seg == "" {
-		return
-	}
-	if isSubdomain(seg) {
-		host = seg + "." + baseDomain
-		return "https://" + host + "/" + rest, host, true
-	}
-	return "https://" + defaultHost + "/" + p, defaultHost, true
-}
 
 func main() {
-	t, _ := strconv.Atoi(env("TIMEOUT", "10"))
-	if t < 1 {
-		t = 10
-	}
-	d := time.Duration(t) * time.Second
+	key = os.Getenv("KEY")
 
-	maxRetries, _ = strconv.Atoi(env("RETRIES", "5"))
-	if maxRetries < 1 {
-		maxRetries = 1
+	t, _ := strconv.Atoi(os.Getenv("TIMEOUT"))
+	if t <= 0 {
+		t = 5
 	}
-	if k := os.Getenv("KEY"); k != "" {
-		proxyKey = []byte(k)
+	timeout = time.Duration(t) * time.Second
+
+	r, _ := strconv.Atoi(os.Getenv("RETRIES"))
+	if r <= 0 {
+		r = 3
 	}
+	retries = r
 
 	client = &fasthttp.Client{
-		ReadTimeout:              d,
-		WriteTimeout:             d,
-		MaxIdleConnDuration:      90 * time.Second,
-		MaxConnsPerHost:          1024,
+		ReadTimeout:              timeout,
+		WriteTimeout:             timeout,
 		NoDefaultUserAgentHeader: true,
+		DisablePathNormalizing:   true,
 	}
 
-	addr := ":" + env("PORT", "8080")
-	log.Printf("KoroneProxy %s", addr)
-	log.Fatal((&fasthttp.Server{
-		Handler:               handle,
-		NoDefaultServerHeader: true,
-		NoDefaultDate:         true,
-		NoDefaultContentType:  true,
-		ReadTimeout:           d,
-		WriteTimeout:          d + d,
-	}).ListenAndServe(addr))
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	fmt.Printf("KoroneProxy listening on :%s\n", port)
+	if err := fasthttp.ListenAndServe(":"+port, handler); err != nil {
+		fmt.Printf("Fatal: %s\n", err)
+		os.Exit(1)
+	}
 }
 
-func handle(ctx *fasthttp.RequestCtx) {
-	if bytes.Equal(ctx.Path(), bHealthz) {
+func handler(ctx *fasthttp.RequestCtx) {
+	path := string(ctx.Path())
+
+	// health check
+	if path == "/healthz" {
 		ctx.SetStatusCode(200)
-		ctx.SetBodyString("ok")
+		ctx.SetContentType("application/json")
+		ctx.SetBodyString(`{"status":"ok"}`)
 		return
 	}
 
-	if len(proxyKey) > 0 && !bytes.Equal(ctx.Request.Header.Peek("PROXYKEY"), proxyKey) {
-		ctx.SetStatusCode(407)
-		ctx.SetBodyString("unauthorized")
-		return
-	}
-
-	uri := string(ctx.Request.Header.RequestURI())
-	if uri == "/" || uri == "" {
-		ctx.SetStatusCode(200)
-		ctx.SetBodyString("KoroneProxy")
-		return
-	}
-
-	target, host, ok := resolve(uri)
-	if !ok {
-		ctx.SetStatusCode(400)
-		ctx.SetBodyString("bad request")
-		return
-	}
-
-	fwd(ctx, target, host, string(ctx.Request.Header.Peek("X-Csrf-Token")))
-}
-
-func fwd(ctx *fasthttp.RequestCtx, url, host, csrf string) {
-	method := ctx.Method()
-	body := ctx.Request.Body()
-
-	req := fasthttp.AcquireRequest()
-	defer fasthttp.ReleaseRequest(req)
-
-	for i := 0; i < maxRetries; i++ {
-		req.Reset()
-		req.Header.SetMethodBytes(method)
-		req.SetRequestURI(url)
-		if len(body) > 0 {
-			req.SetBodyRaw(body)
+	// key auth
+	if key != "" {
+		provided := string(ctx.Request.Header.Peek("x-key"))
+		if provided != key {
+			jsonError(ctx, 403, "Forbidden")
+			return
 		}
+	}
 
+	// parse /{subdomain}/{rest...}
+	trimmed := strings.TrimPrefix(path, "/")
+	if trimmed == "" {
+		jsonError(ctx, 404, "Not Found")
+		return
+	}
+
+	parts := strings.SplitN(trimmed, "/", 2)
+	subdomain := parts[0]
+	rest := ""
+	if len(parts) > 1 {
+		rest = parts[1]
+	}
+
+	if subdomain == "" {
+		jsonError(ctx, 404, "Not Found")
+		return
+	}
+
+	// build target url
+	targetURL := fmt.Sprintf("https://%s.pekora.zip/%s", subdomain, rest)
+	if qs := string(ctx.QueryArgs().QueryString()); qs != "" {
+		targetURL += "?" + qs
+	}
+
+	// user cookies from client
+	userCookie := string(ctx.Request.Header.Peek("Cookie"))
+
+	// x-csrf-token from client header
+	csrfToken := string(ctx.Request.Header.Peek("x-csrf-token"))
+
+	// rbxcsrf4 from client cookie jar
+	rbxcsrf4 := extractCookieValue(userCookie, "rbxcsrf4")
+
+	// if we have neither, do a preflight POST to get both
+	if csrfToken == "" && rbxcsrf4 == "" {
+		csrfToken, rbxcsrf4 = preflight(targetURL, userCookie)
+	}
+
+	// proxy with retries
+	var lastErr error
+	for i := 0; i < retries; i++ {
+		req := fasthttp.AcquireRequest()
+		resp := fasthttp.AcquireResponse()
+
+		req.SetRequestURI(targetURL)
+		req.Header.SetMethod(string(ctx.Method()))
+		req.Header.Set("Host", fmt.Sprintf("%s.pekora.zip", subdomain))
+		req.Header.Set("User-Agent", userAgent)
+
+		// copy client headers — skip ones we manage manually
 		ctx.Request.Header.VisitAll(func(k, v []byte) {
-			if bytes.EqualFold(k, bProxykey) ||
-				bytes.EqualFold(k, bHost) ||
-				bytes.EqualFold(k, bConn) ||
-				bytes.EqualFold(k, bTE) {
+			lo := strings.ToLower(string(k))
+			if lo == "host" ||
+				lo == "x-key" ||
+				lo == "user-agent" ||
+				lo == "cookie" ||
+				lo == "x-csrf-token" {
 				return
 			}
 			req.Header.SetBytesKV(k, v)
 		})
 
-		req.Header.Set("Host", host)
-		req.Header.Set("User-Agent", uaVal)
-		req.Header.Set("Accept", acceptVal)
-		req.Header.Set("Accept-Encoding", acceptEnc)
-		req.Header.Set("Accept-Language", acceptLang)
-		req.Header.Set("Referer", refererVal)
-		req.Header.Set("Origin", originVal)
-		if csrf != "" {
-			req.Header.Set("X-Csrf-Token", csrf)
+		// set x-csrf-token header
+		if csrfToken != "" {
+			req.Header.Set("x-csrf-token", csrfToken)
 		}
-		req.Header.Del("Roblox-Id")
-		req.Header.Del("X-Forwarded-For")
-		req.Header.Del("X-Real-Ip")
 
-		resp := fasthttp.AcquireResponse()
-		if err := client.Do(req, resp); err != nil {
+		// build cookie — user cookies + fresh rbxcsrf4 JWT
+		finalCookie := mergeCookies(userCookie, "rbxcsrf4", rbxcsrf4)
+		if finalCookie != "" {
+			req.Header.Set("Cookie", finalCookie)
+		}
+
+		// body
+		if body := ctx.PostBody(); len(body) > 0 {
+			req.SetBody(body)
+		}
+
+		err := client.DoTimeout(req, resp, timeout)
+		if err != nil {
+			lastErr = err
+			fasthttp.ReleaseRequest(req)
 			fasthttp.ReleaseResponse(resp)
 			continue
 		}
 
-		if resp.StatusCode() == 403 {
-			if t := string(resp.Header.Peek("X-Csrf-Token")); t != "" && t != csrf {
-				csrf = t
+		status := resp.StatusCode()
+
+		// 403 = CSRF rejected
+		// upstream sends: x-csrf-token header + Set-Cookie: rbxcsrf4=<JWT>
+		if status == 403 {
+			newCSRF := string(resp.Header.Peek("x-csrf-token"))
+			newRbxcsrf4 := findSetCookie(resp, "rbxcsrf4")
+
+			if newCSRF != "" {
+				csrfToken = newCSRF
+			}
+			if newRbxcsrf4 != "" {
+				rbxcsrf4 = newRbxcsrf4
+			}
+
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			continue
+		}
+
+		location := string(resp.Header.Peek("Location"))
+		contentType := string(resp.Header.Peek("Content-Type"))
+
+		// block redirects
+		if status >= 300 && status < 400 {
+			if strings.Contains(location, "pekora.zip") ||
+				strings.Contains(location, "roblox.com") {
+				fasthttp.ReleaseRequest(req)
 				fasthttp.ReleaseResponse(resp)
-				continue
+				jsonError(ctx, 404, "Not Found")
+				return
 			}
 		}
 
-		ctx.SetStatusCode(resp.StatusCode())
-		ctx.SetBody(resp.Body())
+		// block HTML
+		if strings.Contains(contentType, "text/html") {
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			jsonError(ctx, 404, "Not Found")
+			return
+		}
+
+		// block upstream 404
+		if status == 404 {
+			fasthttp.ReleaseRequest(req)
+			fasthttp.ReleaseResponse(resp)
+			jsonError(ctx, 404, "Not Found")
+			return
+		}
+
+		// success
+		ctx.SetStatusCode(status)
+
+		// copy response headers
 		resp.Header.VisitAll(func(k, v []byte) {
-			if bytes.EqualFold(k, bTE) || bytes.EqualFold(k, bConn) || bytes.EqualFold(k, bSetCookie) {
-				return
+			lo := strings.ToLower(string(k))
+			if lo == "transfer-encoding" ||
+				lo == "connection" ||
+				lo == "set-cookie" {
+				return // handle set-cookie separately below
 			}
-			ctx.Response.Header.SetBytesKV(k, v)
-		})
-		resp.Header.VisitAllCookie(func(_, v []byte) {
-			ctx.Response.Header.AddBytesKV(bSetCookie, v)
+			ctx.Response.Header.AddBytesKV(k, v)
 		})
 
+		// forward x-csrf-token back to client
+		if v := string(resp.Header.Peek("x-csrf-token")); v != "" {
+			ctx.Response.Header.Set("x-csrf-token", v)
+		}
+
+		// forward Set-Cookie headers back to client properly
+		// VisitAllCookie gives k=cookieName, v=cookieValue (already parsed)
+		resp.Header.VisitAllCookie(func(k, v []byte) {
+			ctx.Response.Header.Add("Set-Cookie", string(k)+"="+string(v))
+		})
+
+		ctx.SetBody(resp.Body())
+
+		fasthttp.ReleaseRequest(req)
 		fasthttp.ReleaseResponse(resp)
 		return
 	}
 
-	ctx.SetStatusCode(502)
-	ctx.SetBodyString("upstream unreachable")
+	msg := "Upstream request failed"
+	if lastErr != nil {
+		msg = lastErr.Error()
+	}
+	jsonError(ctx, 502, msg)
+}
+
+// preflight does an empty POST to get x-csrf-token + rbxcsrf4 Set-Cookie
+func preflight(targetURL string, cookie string) (csrfToken string, rbxcsrf4 string) {
+	req := fasthttp.AcquireRequest()
+	resp := fasthttp.AcquireResponse()
+	defer fasthttp.ReleaseRequest(req)
+	defer fasthttp.ReleaseResponse(resp)
+
+	req.SetRequestURI(targetURL)
+	req.Header.SetMethod("POST")
+	req.Header.Set("Content-Length", "0")
+	req.Header.Set("User-Agent", userAgent)
+	if cookie != "" {
+		req.Header.Set("Cookie", cookie)
+	}
+
+	if err := client.DoTimeout(req, resp, timeout); err != nil {
+		return "", ""
+	}
+
+	csrfToken = string(resp.Header.Peek("x-csrf-token"))
+	rbxcsrf4 = findSetCookie(resp, "rbxcsrf4")
+
+	return csrfToken, rbxcsrf4
+}
+
+// findSetCookie uses VisitAllCookie which gives name/value already split
+func findSetCookie(resp *fasthttp.Response, name string) string {
+	found := ""
+	resp.Header.VisitAllCookie(func(k, v []byte) {
+		if string(k) == name {
+			found = string(v)
+		}
+	})
+	return found
+}
+
+// mergeCookies replaces or appends name=value in existing cookie string
+func mergeCookies(existing string, name string, value string) string {
+	if value == "" {
+		return existing
+	}
+
+	var parts []string
+	if existing != "" {
+		for _, part := range strings.Split(existing, ";") {
+			trimmed := strings.TrimSpace(part)
+			if trimmed == "" {
+				continue
+			}
+			if strings.HasPrefix(trimmed, name+"=") {
+				continue // drop old one
+			}
+			parts = append(parts, trimmed)
+		}
+	}
+
+	parts = append(parts, name+"="+value)
+	return strings.Join(parts, "; ")
+}
+
+// extractCookieValue reads a named cookie from Cookie header string
+func extractCookieValue(cookieHeader string, name string) string {
+	for _, part := range strings.Split(cookieHeader, ";") {
+		trimmed := strings.TrimSpace(part)
+		if strings.HasPrefix(trimmed, name+"=") {
+			return strings.TrimPrefix(trimmed, name+"=")
+		}
+	}
+	return ""
+}
+
+func jsonError(ctx *fasthttp.RequestCtx, status int, message string) {
+	ctx.SetStatusCode(status)
+	ctx.SetContentType("application/json")
+	ctx.SetBodyString(fmt.Sprintf(`{"error":%d,"message":"%s"}`, status, message))
 }
