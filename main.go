@@ -14,6 +14,7 @@ import (
 const (
 	userAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 	baseTarget = "https://www.pekora.zip"
+	allowedDomain = "pekora.zip"
 )
 
 var (
@@ -21,12 +22,12 @@ var (
 	timeout time.Duration
 	retries int
 	client  *fasthttp.Client
-	host    string // e.g. "koroneproxy.up.railway.app"
+	host    string
 )
 
 func main() {
 	key = os.Getenv("KEY")
-	host = os.Getenv("HOST") // set this in Railway: koroneproxy.up.railway.app
+	host = os.Getenv("HOST")
 
 	t, _ := strconv.Atoi(os.Getenv("TIMEOUT"))
 	if t <= 0 {
@@ -59,45 +60,58 @@ func main() {
 	}
 }
 
-func resolveTarget(ctx *fasthttp.RequestCtx) string {
+// isPekoraHost checks that a hostname is pekora.zip or *.pekora.zip
+func isPekoraHost(h string) bool {
+	h = strings.ToLower(h)
+	return h == allowedDomain || strings.HasSuffix(h, "."+allowedDomain)
+}
+
+func resolveTarget(ctx *fasthttp.RequestCtx) (string, bool) {
 	path := string(ctx.Path())
 	reqHost := string(ctx.Host())
 	qs := string(ctx.QueryArgs().QueryString())
 
 	// Format 3: subdomain.koroneproxy.up.railway.app/path
-	// e.g. users.koroneproxy.up.railway.app/v1/users/1
 	if host != "" && strings.HasSuffix(reqHost, "."+host) {
 		subdomain := strings.TrimSuffix(reqHost, "."+host)
-		target := fmt.Sprintf("https://%s.pekora.zip%s", subdomain, path)
+		if subdomain == "" {
+			return "", false
+		}
+		target := fmt.Sprintf("https://%s.%s%s", subdomain, allowedDomain, path)
 		if qs != "" {
 			target += "?" + qs
 		}
-		return target
+		return target, true
 	}
 
-	// Format 2: /https://www.pekora.zip/apisite/...
-	// or /https://users.pekora.zip/v1/...
+	// Format 2: /https://www.pekora.zip/apisite/... or /http://...
 	if strings.HasPrefix(path, "/https://") || strings.HasPrefix(path, "/http://") {
 		raw := strings.TrimPrefix(path, "/")
 		parsed, err := url.Parse(raw)
-		if err == nil {
-			target := parsed.Scheme + "://" + parsed.Host + parsed.Path
-			if qs != "" {
-				target += "?" + qs
-			} else if parsed.RawQuery != "" {
-				target += "?" + parsed.RawQuery
-			}
-			return target
+		if err != nil {
+			return "", false
 		}
+
+		// MUST be pekora.zip domain only
+		if !isPekoraHost(parsed.Host) {
+			return "", false
+		}
+
+		target := parsed.Scheme + "://" + parsed.Host + parsed.Path
+		if qs != "" {
+			target += "?" + qs
+		} else if parsed.RawQuery != "" {
+			target += "?" + parsed.RawQuery
+		}
+		return target, true
 	}
 
-	// Format 1: /apisite/catalog/v1/...  or any path
-	// → https://www.pekora.zip/apisite/catalog/v1/...
+	// Format 1: /apisite/catalog/v1/... → https://www.pekora.zip/apisite/...
 	target := baseTarget + path
 	if qs != "" {
 		target += "?" + qs
 	}
-	return target
+	return target, true
 }
 
 func handler(ctx *fasthttp.RequestCtx) {
@@ -120,8 +134,20 @@ func handler(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	// resolve target URL from any of the 3 formats
-	targetURL := resolveTarget(ctx)
+	// resolve target URL
+	targetURL, ok := resolveTarget(ctx)
+	if !ok {
+		// bad domain or invalid URL
+		jsonError(ctx, 403, "Forbidden: only pekora.zip is allowed")
+		return
+	}
+
+	// double check final target is pekora.zip
+	parsed, err := url.Parse(targetURL)
+	if err != nil || !isPekoraHost(parsed.Host) {
+		jsonError(ctx, 403, "Forbidden: only pekora.zip is allowed")
+		return
+	}
 
 	fmt.Printf("[PROXY] %s %s → %s\n", string(ctx.Method()), path, targetURL)
 
@@ -148,12 +174,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 		req.SetRequestURI(targetURL)
 		req.Header.SetMethod(string(ctx.Method()))
 		req.Header.Set("User-Agent", userAgent)
-
-		// set host header correctly based on target
-		parsed, err := url.Parse(targetURL)
-		if err == nil {
-			req.Header.Set("Host", parsed.Host)
-		}
+		req.Header.Set("Host", parsed.Host)
 
 		// copy client headers — skip ones we manage manually
 		ctx.Request.Header.VisitAll(func(k, v []byte) {
@@ -274,11 +295,8 @@ func handler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	msg := "Upstream request failed"
-	if lastErr != nil {
-		msg = lastErr.Error()
-	}
-	jsonError(ctx, 502, msg)
+	// all retries failed — hide internal error details
+	jsonError(ctx, 502, "Upstream request failed")
 }
 
 // preflight does an empty POST to get x-csrf-token + rbxcsrf4 Set-Cookie
@@ -305,7 +323,7 @@ func preflight(targetURL string, cookie string) (csrfToken string, rbxcsrf4 stri
 	return csrfToken, rbxcsrf4
 }
 
-// findSetCookie uses VisitAllCookie which gives name/value already split
+// findSetCookie scans Set-Cookie for a specific cookie name
 func findSetCookie(resp *fasthttp.Response, name string) string {
 	found := ""
 	resp.Header.VisitAllCookie(func(k, v []byte) {
