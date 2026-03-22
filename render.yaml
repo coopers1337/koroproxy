@@ -5,10 +5,13 @@ services:
     repo: https://github.com/coopers1337/koroproxy.git
     buildCommand: go build -o app .
     startCommand: ./app
+    healthCheckPath: /healthz
     envVars:
       - key: TIMEOUT
         value: "10"
       - key: RETRIES
         value: "5"
+      - key: PORT
+        value: "8080"
       - key: KEY
         sync: false

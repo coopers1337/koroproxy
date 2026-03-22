@@ -19,9 +19,9 @@ var (
 )
 
 const (
-	baseDomain    = "pekora.zip"
-	baseHost      = "www.pekora.zip"
-	userAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+	baseDomain     = "pekora.zip"
+	baseHost       = "www.pekora.zip"
+	userAgent      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 	redirectTarget = "https://www.pekora.zip/"
 )
 
@@ -37,6 +37,10 @@ func main() {
 		retries = 1
 	}
 
+	if port == "" {
+		port = "8080"
+	}
+
 	client = &fasthttp.Client{
 		ReadTimeout:         time.Duration(timeout) * time.Second,
 		WriteTimeout:        time.Duration(timeout) * time.Second,
@@ -44,43 +48,21 @@ func main() {
 		MaxConnsPerHost:     512,
 	}
 
-	log.Printf("PekoraProxy starting on port %s (timeout=%ds, retries=%d)", port, timeout, retries)
+	log.Printf("KoroneProxy starting on port %s (timeout=%ds, retries=%d)", port, timeout, retries)
 
 	if err := fasthttp.ListenAndServe(":"+port, requestHandler); err != nil {
 		log.Fatalf("Error in ListenAndServe: %s", err)
 	}
 }
 
-// isPekoraDomain checks if a hostname belongs to pekora.zip (any subdomain).
 func isPekoraDomain(host string) bool {
 	host = strings.ToLower(host)
-	// Remove port if present
 	if idx := strings.LastIndex(host, ":"); idx != -1 {
 		host = host[:idx]
 	}
 	return host == baseDomain || strings.HasSuffix(host, "."+baseDomain)
 }
 
-// resolveTargetURL takes the raw request URI and builds the upstream URL.
-//
-// Supported formats:
-//
-//  1. Full URL with any pekora.zip subdomain:
-//     /https://apis.pekora.zip/endpoint
-//     /https://assetgame.pekora.zip/v1/something
-//     /https://www.pekora.zip/apisite/privatemessages/v1/messages/unread/count
-//     /http://economy.pekora.zip/v2/something
-//
-//  2. Subdomain-prefixed relative path (RoProxy style):
-//     /apis/privatemessages/v1/messages/unread/count
-//     → https://apis.pekora.zip/privatemessages/v1/messages/unread/count
-//
-//  3. Direct path (no subdomain prefix, defaults to www):
-//     /apisite/privatemessages/v1/messages/unread/count
-//     → tries as subdomain first; if the first segment looks like a known
-//       pattern it uses www.pekora.zip/apisite/...
-//
-// The function returns the target URL and a boolean indicating success.
 func resolveTargetURL(rawURI string) (string, bool) {
 	if len(rawURI) < 2 {
 		return "", false
@@ -88,25 +70,18 @@ func resolveTargetURL(rawURI string) (string, bool) {
 
 	pathAfterSlash := rawURI[1:]
 
-	// Format 1: Full URL
 	if strings.HasPrefix(pathAfterSlash, "https://") || strings.HasPrefix(pathAfterSlash, "http://") {
 		parsed, err := url.Parse(pathAfterSlash)
 		if err != nil {
 			return "", false
 		}
-		// Always force HTTPS
 		parsed.Scheme = "https"
-		// If host is empty or not a pekora domain, default to baseHost
 		if parsed.Host == "" || !isPekoraDomain(parsed.Host) {
 			parsed.Host = baseHost
 		}
 		return parsed.String(), true
 	}
 
-	// Format 2 & 3: Relative path
-	// Split into first segment and the rest
-	// e.g. "apis/privatemessages/v1/..." → ["apis", "privatemessages/v1/..."]
-	// e.g. "apisite/privatemessages/v1/..." → ["apisite", "privatemessages/v1/..."]
 	parts := strings.SplitN(pathAfterSlash, "/", 2)
 	firstSegment := parts[0]
 	remainingPath := ""
@@ -118,35 +93,22 @@ func resolveTargetURL(rawURI string) (string, bool) {
 		return "", false
 	}
 
-	// Build URL: treat first segment as subdomain of pekora.zip
-	// e.g. apis → apis.pekora.zip
-	// e.g. assetgame → assetgame.pekora.zip
-	// e.g. www → www.pekora.zip
-	// e.g. economy → economy.pekora.zip
 	subdomain := strings.ToLower(firstSegment)
 	host := subdomain + "." + baseDomain
-
 	targetURL := "https://" + host + "/" + remainingPath
 
 	return targetURL, true
 }
 
-// requestHandler is the main HTTP handler.
-//
-// Supports:
-//   - PROXYKEY authentication
-//   - All pekora.zip subdomains (apis, assetgame, economy, www, etc.)
-//   - Full URL and relative path formats
-//   - CSRF token auto-refresh on 403
-//   - Cookie forwarding (including .ROBLOSECURITY, rbxcsrf4, etc.)
-//   - 404 redirect to https://www.pekora.zip/
 func requestHandler(ctx *fasthttp.RequestCtx) {
-	// --- Authentication ---
+	// Health check endpoint
 	if string(ctx.Path()) == "/healthz" {
-    ctx.SetStatusCode(200)
-    ctx.SetBody([]byte("ok"))
-    return
-    } 
+		ctx.SetStatusCode(200)
+		ctx.SetBody([]byte("ok"))
+		return
+	}
+
+	// Authentication
 	val, ok := os.LookupEnv("KEY")
 	if ok && val != "" && string(ctx.Request.Header.Peek("PROXYKEY")) != val {
 		ctx.SetStatusCode(407)
@@ -154,10 +116,9 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// --- Build target URL ---
+	// Build target URL
 	rawURI := string(ctx.Request.Header.RequestURI())
 
-	// Handle root path
 	if rawURI == "/" || rawURI == "" {
 		ctx.Redirect(redirectTarget, fasthttp.StatusFound)
 		return
@@ -169,21 +130,20 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// --- Make the proxied request with CSRF retry logic ---
+	// Make request with CSRF retry
 	csrfToken := string(ctx.Request.Header.Peek("x-csrf-token"))
 	response := makeRequestWithCSRF(ctx, targetURL, csrfToken, 1)
 	defer fasthttp.ReleaseResponse(response)
 
-	// --- Handle 404: redirect to pekora.zip ---
+	// Handle 404 redirect
 	if response.StatusCode() == 404 {
 		ctx.Redirect(redirectTarget, fasthttp.StatusFound)
 		return
 	}
 
-	// --- Copy response back to client ---
+	// Copy response back to client
 	ctx.SetStatusCode(response.StatusCode())
 
-	// Copy all response headers
 	response.Header.VisitAll(func(key, value []byte) {
 		keyStr := string(key)
 		switch strings.ToLower(keyStr) {
@@ -193,7 +153,6 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 		ctx.Response.Header.Set(keyStr, string(value))
 	})
 
-	// Copy Set-Cookie headers properly (there can be multiple)
 	response.Header.VisitAllCookie(func(key, value []byte) {
 		ctx.Response.Header.AddBytesKV([]byte("Set-Cookie"), value)
 	})
@@ -201,15 +160,6 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 	ctx.SetBody(response.Body())
 }
 
-// makeRequestWithCSRF performs the upstream HTTP request with automatic
-// CSRF token refresh handling.
-//
-// Flow:
-//  1. Build request with all client headers, cookies, and CSRF token
-//  2. Send to upstream pekora.zip subdomain
-//  3. If 403 + new x-csrf-token in response → retry with new token
-//  4. On network error → retry up to max retries
-//  5. Return final response
 func makeRequestWithCSRF(ctx *fasthttp.RequestCtx, targetURL string, csrfToken string, attempt int) *fasthttp.Response {
 	if attempt > retries {
 		resp := fasthttp.AcquireResponse()
@@ -221,14 +171,10 @@ func makeRequestWithCSRF(ctx *fasthttp.RequestCtx, targetURL string, csrfToken s
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 
-	// Set method and URL
 	req.Header.SetMethod(string(ctx.Method()))
 	req.SetRequestURI(targetURL)
-
-	// Set body
 	req.SetBody(ctx.Request.Body())
 
-	// Parse the target URL to get the correct host for the Host header
 	parsed, err := url.Parse(targetURL)
 	if err != nil {
 		resp := fasthttp.AcquireResponse()
@@ -238,12 +184,9 @@ func makeRequestWithCSRF(ctx *fasthttp.RequestCtx, targetURL string, csrfToken s
 	}
 	targetHost := parsed.Host
 
-	// Copy all headers from original request
 	ctx.Request.Header.VisitAll(func(key, value []byte) {
 		keyStr := string(key)
 		keyLower := strings.ToLower(keyStr)
-
-		// Skip proxy-specific and hop-by-hop headers
 		switch keyLower {
 		case "proxykey", "host", "connection", "transfer-encoding":
 			return
@@ -251,7 +194,6 @@ func makeRequestWithCSRF(ctx *fasthttp.RequestCtx, targetURL string, csrfToken s
 		req.Header.Set(keyStr, string(value))
 	})
 
-	// Set required headers
 	req.Header.Set("User-Agent", userAgent)
 	req.Header.Set("Host", targetHost)
 	req.Header.Set("Accept", "application/json, text/plain, */*")
@@ -260,18 +202,15 @@ func makeRequestWithCSRF(ctx *fasthttp.RequestCtx, targetURL string, csrfToken s
 	req.Header.Set("Referer", "https://www.pekora.zip/")
 	req.Header.Set("Origin", "https://www.pekora.zip")
 
-	// Forward cookies from client request
 	clientCookie := string(ctx.Request.Header.Peek("Cookie"))
 	if clientCookie != "" {
 		req.Header.Set("Cookie", clientCookie)
 	}
 
-	// Set CSRF token if we have one
 	if csrfToken != "" {
 		req.Header.Set("x-csrf-token", csrfToken)
 	}
 
-	// Remove identifying headers
 	req.Header.Del("Roblox-Id")
 	req.Header.Del("X-Forwarded-For")
 	req.Header.Del("X-Real-Ip")
@@ -285,14 +224,10 @@ func makeRequestWithCSRF(ctx *fasthttp.RequestCtx, targetURL string, csrfToken s
 		return makeRequestWithCSRF(ctx, targetURL, csrfToken, attempt+1)
 	}
 
-	// --- CSRF handling ---
-	// pekora.zip (like Roblox) returns 403 with a fresh x-csrf-token
-	// when the token is missing or expired. We grab it and retry.
 	if resp.StatusCode() == 403 {
 		newToken := string(resp.Header.Peek("x-csrf-token"))
 		if newToken != "" && newToken != csrfToken {
-			log.Printf("CSRF token refresh on attempt %d for %s (token: %s...)",
-				attempt, targetURL, truncate(newToken, 12))
+			log.Printf("CSRF token refresh on attempt %d for %s", attempt, targetURL)
 			fasthttp.ReleaseResponse(resp)
 			return makeRequestWithCSRF(ctx, targetURL, newToken, attempt+1)
 		}
@@ -301,7 +236,6 @@ func makeRequestWithCSRF(ctx *fasthttp.RequestCtx, targetURL string, csrfToken s
 	return resp
 }
 
-// truncate returns the first n characters of s, or s if shorter.
 func truncate(s string, n int) string {
 	if len(s) <= n {
 		return s

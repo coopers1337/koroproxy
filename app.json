@@ -1,6 +1,6 @@
 {
   "name": "KoroneProxy",
-  "description": "A reverse proxy for pekora.zip APIs with CSRF handling, cookie forwarding, and flexible URL formats.",
+  "description": "A reverse proxy for pekora.zip APIs with CSRF handling, cookie forwarding, subdomain support and 404 redirect.",
   "repository": "https://github.com/coopers1337/koroproxy",
   "env": {
     "KEY": {
@@ -14,6 +14,10 @@
     "RETRIES": {
       "description": "The maximum number of times to attempt a request. Minimum: 1",
       "value": "5"
+    },
+    "PORT": {
+      "description": "The port the server listens on.",
+      "value": "8080"
     }
   }
 }
