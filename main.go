@@ -1,8 +1,8 @@
 package main
 
 import (
+	"bytes"
 	"log"
-	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -11,318 +11,239 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
+const (
+	baseDomain  = "pekora.zip"
+	defaultHost = "www." + baseDomain
+	originVal   = "https://" + defaultHost
+	refererVal  = originVal + "/"
+	uaVal       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+	acceptVal   = "application/json, text/plain, */*"
+	acceptEnc   = "gzip, deflate, br"
+	acceptLang  = "en-US,en;q=0.9"
+)
+
 var (
-	timeout, _ = strconv.Atoi(getEnvDefault("TIMEOUT", "10"))
-	retries, _ = strconv.Atoi(getEnvDefault("RETRIES", "5"))
-	port       = getEnvDefault("PORT", "8080")
+	maxRetries int
+	proxyKey   []byte
 	client     *fasthttp.Client
 )
 
-const (
-	baseDomain     = "pekora.zip"
-	baseHost       = "www.pekora.zip"
-	userAgent      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+var (
+	bHealthz   = []byte("/healthz")
+	bProxykey  = []byte("proxykey")
+	bHost      = []byte("host")
+	bConn      = []byte("connection")
+	bTE        = []byte("transfer-encoding")
+	bSetCookie = []byte("Set-Cookie")
 )
 
-var knownSubdomains = map[string]bool{
-	"apis":            true,
-	"assetgame":       true,
-	"economy":         true,
-	"auth":            true,
-	"catalog":         true,
-	"inventory":       true,
-	"friends":         true,
-	"thumbnails":      true,
-	"games":           true,
-	"users":           true,
-	"presence":        true,
-	"chat":            true,
-	"contacts":        true,
-	"groups":          true,
-	"badges":          true,
-	"avatar":          true,
-	"develop":         true,
-	"forums":          true,
-	"locale":          true,
-	"metrics":         true,
-	"notifications":   true,
-	"points":          true,
-	"premiumfeatures": true,
-	"publish":         true,
-	"trades":          true,
-	"www":             true,
+func env(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
 }
 
-func getEnvDefault(key, fallback string) string {
-	if val, ok := os.LookupEnv(key); ok && val != "" {
-		return val
+func isSubdomain(s string) bool {
+	switch s {
+	case "apis", "assetgame", "economy", "auth", "catalog",
+		"inventory", "friends", "thumbnails", "games", "users",
+		"presence", "chat", "contacts", "groups", "badges",
+		"avatar", "develop", "forums", "locale", "metrics",
+		"notifications", "points", "premiumfeatures", "publish",
+		"trades", "www":
+		return true
 	}
-	return fallback
+	return false
+}
+
+func resolve(uri string) (target, host string, ok bool) {
+	if len(uri) < 2 {
+		return
+	}
+	p := uri[1:]
+
+	full := false
+	if strings.HasPrefix(p, "https://") {
+		full = true
+	} else if strings.HasPrefix(p, "http://") {
+		p = "https://" + p[7:]
+		full = true
+	}
+
+	if full {
+		a := p[8:]
+		si := strings.IndexByte(a, '/')
+		if si < 0 {
+			si = len(a)
+		}
+		host = a[:si]
+		h := host
+		if ci := strings.LastIndexByte(h, ':'); ci >= 0 {
+			h = h[:ci]
+		}
+		h = strings.ToLower(h)
+		if h != baseDomain && !strings.HasSuffix(h, "."+baseDomain) {
+			host = defaultHost
+			if si < len(a) {
+				return "https://" + host + a[si:], host, true
+			}
+			return "https://" + host + "/", host, true
+		}
+		return p, host, true
+	}
+
+	si := strings.IndexByte(p, '/')
+	var seg, rest string
+	if si >= 0 {
+		seg, rest = strings.ToLower(p[:si]), p[si+1:]
+	} else {
+		seg = strings.ToLower(p)
+	}
+	if seg == "" {
+		return
+	}
+	if isSubdomain(seg) {
+		host = seg + "." + baseDomain
+		return "https://" + host + "/" + rest, host, true
+	}
+	return "https://" + defaultHost + "/" + p, defaultHost, true
 }
 
 func main() {
-	if retries < 1 {
-		retries = 1
+	t, _ := strconv.Atoi(env("TIMEOUT", "10"))
+	if t < 1 {
+		t = 10
 	}
+	d := time.Duration(t) * time.Second
 
-	if port == "" {
-		port = "8080"
+	maxRetries, _ = strconv.Atoi(env("RETRIES", "5"))
+	if maxRetries < 1 {
+		maxRetries = 1
+	}
+	if k := os.Getenv("KEY"); k != "" {
+		proxyKey = []byte(k)
 	}
 
 	client = &fasthttp.Client{
-		ReadTimeout:         time.Duration(timeout) * time.Second,
-		WriteTimeout:        time.Duration(timeout) * time.Second,
-		MaxIdleConnDuration: 60 * time.Second,
-		MaxConnsPerHost:     512,
+		ReadTimeout:              d,
+		WriteTimeout:             d,
+		MaxIdleConnDuration:      90 * time.Second,
+		MaxConnsPerHost:          1024,
+		NoDefaultUserAgentHeader: true,
 	}
 
-	log.Printf("KoroneProxy starting on port %s (timeout=%ds, retries=%d)", port, timeout, retries)
-
-	if err := fasthttp.ListenAndServe(":"+port, requestHandler); err != nil {
-		log.Fatalf("Error in ListenAndServe: %s", err)
-	}
+	addr := ":" + env("PORT", "8080")
+	log.Printf("KoroneProxy %s", addr)
+	log.Fatal((&fasthttp.Server{
+		Handler:               handle,
+		NoDefaultServerHeader: true,
+		NoDefaultDate:         true,
+		NoDefaultContentType:  true,
+		ReadTimeout:           d,
+		WriteTimeout:          d + d,
+	}).ListenAndServe(addr))
 }
 
-func isPekoraDomain(host string) bool {
-	host = strings.ToLower(host)
-	if idx := strings.LastIndex(host, ":"); idx != -1 {
-		host = host[:idx]
-	}
-	return host == baseDomain || strings.HasSuffix(host, "."+baseDomain)
-}
-
-func resolveTargetURL(rawURI string) (string, bool) {
-	if len(rawURI) < 2 {
-		return "", false
-	}
-
-	pathAfterSlash := rawURI[1:]
-
-	if strings.HasPrefix(pathAfterSlash, "https://") || strings.HasPrefix(pathAfterSlash, "http://") {
-		parsed, err := url.Parse(pathAfterSlash)
-		if err != nil {
-			return "", false
-		}
-		parsed.Scheme = "https"
-		if parsed.Host == "" || !isPekoraDomain(parsed.Host) {
-			parsed.Host = baseHost
-		}
-		return parsed.String(), true
-	}
-
-	parts := strings.SplitN(pathAfterSlash, "/", 2)
-	firstSegment := strings.ToLower(parts[0])
-	remainingPath := ""
-	if len(parts) > 1 {
-		remainingPath = parts[1]
-	}
-
-	if firstSegment == "" {
-		return "", false
-	}
-
-	if knownSubdomains[firstSegment] {
-		host := firstSegment + "." + baseDomain
-		targetURL := "https://" + host + "/" + remainingPath
-		return targetURL, true
-	}
-
-	targetURL := "https://" + baseHost + "/" + pathAfterSlash
-	return targetURL, true
-}
-
-func requestHandler(ctx *fasthttp.RequestCtx) {
-	if string(ctx.Path()) == "/healthz" {
+func handle(ctx *fasthttp.RequestCtx) {
+	if bytes.Equal(ctx.Path(), bHealthz) {
 		ctx.SetStatusCode(200)
-		ctx.SetBody([]byte("ok"))
+		ctx.SetBodyString("ok")
 		return
 	}
 
-	val, ok := os.LookupEnv("KEY")
-	if ok && val != "" && string(ctx.Request.Header.Peek("PROXYKEY")) != val {
+	if len(proxyKey) > 0 && !bytes.Equal(ctx.Request.Header.Peek("PROXYKEY"), proxyKey) {
 		ctx.SetStatusCode(407)
-		ctx.SetBody([]byte("Missing or invalid PROXYKEY header."))
+		ctx.SetBodyString("unauthorized")
 		return
 	}
 
-	rawURI := string(ctx.Request.Header.RequestURI())
-
-	if rawURI == "/" || rawURI == "" {
+	uri := string(ctx.Request.Header.RequestURI())
+	if uri == "/" || uri == "" {
 		ctx.SetStatusCode(200)
-		ctx.SetContentType("text/html; charset=utf-8")
-		ctx.SetBody([]byte(`
-			<!DOCTYPE html>
-			<html lang="en">
-			<head>
-				<meta charset="UTF-8">
-				<title>KoroneProxy</title>
-				<style>
-					body { font-family: system-ui, -apple-system, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
-					h1 { color: #222; }
-					.example { background: #f0f0f0; padding: 1rem; border-radius: 8px; margin: 1rem 0; }
-					pre { background: #eee; padding: 0.5rem; border-radius: 4px; overflow-x: auto; }
-				</style>
-			</head>
-			<body>
-				<h1>KoroneProxy</h1>
-				<p>Reverse proxy for pekora.zip APIs.</p>
-				<h2>Usage Examples:</h2>
-				<div class="example">
-					<h3>Main site path:</h3>
-					<pre>/apisite/api/alerts/alert-info</pre>
-					<p>→ <code>https://www.pekora.zip/apisite/api/alerts/alert-info</code></p>
-				</div>
-				<div class="example">
-					<h3>Subdomain path:</h3>
-					<pre>/apis/v1/something</pre>
-					<p>→ <code>https://apis.pekora.zip/v1/something</code></p>
-				</div>
-				<div class="example">
-					<h3>Full URL format:</h3>
-					<pre>/https://www.pekora.zip/apisite/api/alerts/alert-info</pre>
-					<p>→ <code>https://www.pekora.zip/apisite/api/alerts/alert-info</code></p>
-				</div>
-				<h2>Supported Methods:</h2>
-				<p>GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD, etc.</p>
-			</body>
-			</html>
-		`))
+		ctx.SetBodyString("KoroneProxy")
 		return
 	}
 
-	targetURL, valid := resolveTargetURL(rawURI)
-	if !valid {
+	target, host, ok := resolve(uri)
+	if !ok {
 		ctx.SetStatusCode(400)
-		ctx.SetContentType("text/html; charset=utf-8")
-		ctx.SetBody([]byte(`
-			<!DOCTYPE html>
-			<html lang="en">
-			<head>
-				<meta charset="UTF-8">
-				<title>400 Bad Request - KoroneProxy</title>
-				<style>
-					body { font-family: system-ui, -apple-system, sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; text-align: center; }
-					h1 { color: #dc2626; }
-				</style>
-			</head>
-			<body>
-				<h1>400 Bad Request</h1>
-				<p>Invalid URL format. Check your request.</p>
-			</body>
-			</html>
-		`))
+		ctx.SetBodyString("bad request")
 		return
 	}
 
-	response := makeRequestWithCSRF(ctx, targetURL, string(ctx.Request.Header.Peek("x-csrf-token")), 1)
-	defer fasthttp.ReleaseResponse(response)
-
-	if response.StatusCode() == 404 {
-		ctx.SetStatusCode(404)
-		ctx.SetContentType("text/html; charset=utf-8")
-		ctx.SetBody([]byte(`
-			<!DOCTYPE html>
-			<html lang="en">
-			<head>
-				<meta charset="UTF-8">
-				<title>404 Not Found - KoroneProxy</title>
-				<style>
-					body { font-family: system-ui, -apple-system, sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; text-align: center; }
-					h1 { color: #dc2626; }
-				</style>
-			</head>
-			<body>
-				<h1>404 Not Found</h1>
-				<p>The requested URL was not found on this proxy.</p>
-				<p>Check your URL format and try again.</p>
-			</body>
-			</html>
-		`))
-		return
-	}
-
-	ctx.SetStatusCode(response.StatusCode())
-	ctx.SetBody(response.Body())
-
-	response.Header.VisitAll(func(key, value []byte) {
-		keyStr := string(key)
-		keyLower := strings.ToLower(keyStr)
-		switch keyLower {
-		case "transfer-encoding", "connection":
-			return
-		}
-		ctx.Response.Header.Set(keyStr, string(value))
-	})
-
-	response.Header.VisitAllCookie(func(key, value []byte) {
-		ctx.Response.Header.AddBytesKV([]byte("Set-Cookie"), value)
-	})
+	fwd(ctx, target, host, string(ctx.Request.Header.Peek("X-Csrf-Token")))
 }
 
-func makeRequestWithCSRF(ctx *fasthttp.RequestCtx, targetURL string, csrfToken string, attempt int) *fasthttp.Response {
-	if attempt > retries {
-		resp := fasthttp.AcquireResponse()
-		resp.SetBody([]byte("Proxy failed to connect after maximum retries. Please try again."))
-		resp.SetStatusCode(500)
-		return resp
-	}
+func fwd(ctx *fasthttp.RequestCtx, url, host, csrf string) {
+	method := ctx.Method()
+	body := ctx.Request.Body()
 
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 
-	req.Header.SetMethod(string(ctx.Method()))
-	req.SetRequestURI(targetURL)
-	req.SetBody(ctx.Request.Body())
+	for i := 0; i < maxRetries; i++ {
+		req.Reset()
+		req.Header.SetMethodBytes(method)
+		req.SetRequestURI(url)
+		if len(body) > 0 {
+			req.SetBodyRaw(body)
+		}
 
-	parsed, err := url.Parse(targetURL)
-	if err != nil {
+		ctx.Request.Header.VisitAll(func(k, v []byte) {
+			if bytes.EqualFold(k, bProxykey) ||
+				bytes.EqualFold(k, bHost) ||
+				bytes.EqualFold(k, bConn) ||
+				bytes.EqualFold(k, bTE) {
+				return
+			}
+			req.Header.SetBytesKV(k, v)
+		})
+
+		req.Header.Set("Host", host)
+		req.Header.Set("User-Agent", uaVal)
+		req.Header.Set("Accept", acceptVal)
+		req.Header.Set("Accept-Encoding", acceptEnc)
+		req.Header.Set("Accept-Language", acceptLang)
+		req.Header.Set("Referer", refererVal)
+		req.Header.Set("Origin", originVal)
+		if csrf != "" {
+			req.Header.Set("X-Csrf-Token", csrf)
+		}
+		req.Header.Del("Roblox-Id")
+		req.Header.Del("X-Forwarded-For")
+		req.Header.Del("X-Real-Ip")
+
 		resp := fasthttp.AcquireResponse()
-		resp.SetBody([]byte("Invalid target URL."))
-		resp.SetStatusCode(400)
-		return resp
-	}
-	targetHost := parsed.Host
-
-	ctx.Request.Header.VisitAll(func(key, value []byte) {
-		keyStr := string(key)
-		keyLower := strings.ToLower(keyStr)
-		switch keyLower {
-		case "proxykey", "host", "connection", "transfer-encoding":
-			return
-		}
-		req.Header.Set(keyStr, string(value))
-	})
-
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Host", targetHost)
-	req.Header.Set("Accept", "application/json, text/plain, */*")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-	req.Header.Set("Referer", "https://www.pekora.zip/")
-	req.Header.Set("Origin", "https://www.pekora.zip")
-
-	if csrfToken != "" {
-		req.Header.Set("x-csrf-token", csrfToken)
-	}
-
-	req.Header.Del("Roblox-Id")
-	req.Header.Del("X-Forwarded-For")
-	req.Header.Del("X-Real-Ip")
-
-	resp := fasthttp.AcquireResponse()
-	err = client.Do(req, resp)
-	if err != nil {
-		fasthttp.ReleaseResponse(resp)
-		return makeRequestWithCSRF(ctx, targetURL, csrfToken, attempt+1)
-	}
-
-	if resp.StatusCode() == 403 {
-		newToken := string(resp.Header.Peek("x-csrf-token"))
-		if newToken != "" && newToken != csrfToken {
+		if err := client.Do(req, resp); err != nil {
 			fasthttp.ReleaseResponse(resp)
-			return makeRequestWithCSRF(ctx, targetURL, newToken, attempt+1)
+			continue
 		}
+
+		if resp.StatusCode() == 403 {
+			if t := string(resp.Header.Peek("X-Csrf-Token")); t != "" && t != csrf {
+				csrf = t
+				fasthttp.ReleaseResponse(resp)
+				continue
+			}
+		}
+
+		ctx.SetStatusCode(resp.StatusCode())
+		ctx.SetBody(resp.Body())
+		resp.Header.VisitAll(func(k, v []byte) {
+			if bytes.EqualFold(k, bTE) || bytes.EqualFold(k, bConn) || bytes.EqualFold(k, bSetCookie) {
+				return
+			}
+			ctx.Response.Header.SetBytesKV(k, v)
+		})
+		resp.Header.VisitAllCookie(func(_, v []byte) {
+			ctx.Response.Header.AddBytesKV(bSetCookie, v)
+		})
+
+		fasthttp.ReleaseResponse(resp)
+		return
 	}
 
-	return resp
+	ctx.SetStatusCode(502)
+	ctx.SetBodyString("upstream unreachable")
 }
