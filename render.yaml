@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: koroneproxy
+    env: go
+    repo: https://github.com/yourusername/pekoraproxy.git
+    buildCommand: go build -tags netgo -ldflags '-s -w' -o app
+    startCommand: ./app
+    envVars:
+      - key: TIMEOUT
+        value: "10"
+      - key: RETRIES
+        value: "5"
+      - key: KEY
+        sync: false

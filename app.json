@@ -1,0 +1,19 @@
+{
+  "name": "KoroneProxy",
+  "description": "A reverse proxy for pekora.zip APIs with CSRF handling, cookie forwarding, and flexible URL formats.",
+  "repository": "https://github.com/yourusername/pekoraproxy",
+  "env": {
+    "KEY": {
+      "description": "The key used to access the proxy.",
+      "generator": "secret"
+    },
+    "TIMEOUT": {
+      "description": "The number of seconds before a request times out and is retried.",
+      "value": "10"
+    },
+    "RETRIES": {
+      "description": "The maximum number of times to attempt a request. Minimum: 1",
+      "value": "5"
+    }
+  }
+}
