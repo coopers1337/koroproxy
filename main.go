@@ -71,6 +71,18 @@ func isPekoraHost(h string) bool {
 	return h == allowedDomain || strings.HasSuffix(h, "."+allowedDomain)
 }
 
+func normalizeURL(raw string) string {
+	raw = strings.Replace(raw, "https:///", "https://", 1)
+	raw = strings.Replace(raw, "http:///", "http://", 1)
+	if strings.Contains(raw, "https:/") && !strings.Contains(raw, "https://") {
+		raw = strings.Replace(raw, "https:/", "https://", 1)
+	}
+	if strings.Contains(raw, "http:/") && !strings.Contains(raw, "http://") {
+		raw = strings.Replace(raw, "http:/", "http://", 1)
+	}
+	return raw
+}
+
 func resolveTarget(ctx *fasthttp.RequestCtx) (string, bool) {
 	path := string(ctx.Path())
 	reqHost := string(ctx.Host())
@@ -88,8 +100,9 @@ func resolveTarget(ctx *fasthttp.RequestCtx) (string, bool) {
 		return target, true
 	}
 
-	if strings.HasPrefix(path, "/https://") || strings.HasPrefix(path, "/http://") {
+	if strings.Contains(path, "http:/") || strings.Contains(path, "https:/") {
 		raw := strings.TrimPrefix(path, "/")
+		raw = normalizeURL(raw)
 		parsed, err := url.Parse(raw)
 		if err != nil {
 			return "", false
@@ -131,8 +144,9 @@ func handler(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	if strings.Contains(path, "://") {
+	if strings.Contains(path, "http:/") || strings.Contains(path, "https:/") {
 		raw := strings.TrimPrefix(path, "/")
+		raw = normalizeURL(raw)
 		parsed, err := url.Parse(raw)
 		if err != nil || !isPekoraHost(parsed.Host) {
 			jsonError(ctx, 403, "Forbidden: only pekora.zip is allowed")
