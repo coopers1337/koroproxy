@@ -1,7 +1,7 @@
 {
   "name": "KoroneProxy",
   "description": "A reverse proxy for pekora.zip APIs with CSRF handling, cookie forwarding, and flexible URL formats.",
-  "repository": "https://github.com/yourusername/pekoraproxy",
+  "repository": "https://github.com/coopers1337/koroproxy",
   "env": {
     "KEY": {
       "description": "The key used to access the proxy.",

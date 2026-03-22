@@ -2,7 +2,7 @@ services:
   - type: web
     name: koroneproxy
     env: go
-    repo: https://github.com/yourusername/pekoraproxy.git
+    repo: https://github.com/coopers1337/koroproxy.git
     buildCommand: go build -tags netgo -ldflags '-s -w' -o app
     startCommand: ./app
     envVars:
