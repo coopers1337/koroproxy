@@ -22,12 +22,8 @@ const (
 	baseDomain     = "pekora.zip"
 	baseHost       = "www.pekora.zip"
 	userAgent      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-	redirectTarget = "https://www.pekora.zip/"
 )
 
-// knownSubdomains is the list of known pekora.zip subdomains.
-// If the first path segment matches one of these, it will be used
-// as a subdomain. Otherwise the full path goes to www.pekora.zip.
 var knownSubdomains = map[string]bool{
 	"apis":            true,
 	"assetgame":       true,
@@ -102,8 +98,6 @@ func resolveTargetURL(rawURI string) (string, bool) {
 
 	pathAfterSlash := rawURI[1:]
 
-	// Format 1: Full URL passed in path
-	// e.g. /https://apis.pekora.zip/v1/something
 	if strings.HasPrefix(pathAfterSlash, "https://") || strings.HasPrefix(pathAfterSlash, "http://") {
 		parsed, err := url.Parse(pathAfterSlash)
 		if err != nil {
@@ -116,11 +110,6 @@ func resolveTargetURL(rawURI string) (string, bool) {
 		return parsed.String(), true
 	}
 
-	// Format 2: Relative path
-	// Check if first segment is a known subdomain
-	// e.g. /apis/v1/something   → https://apis.pekora.zip/v1/something
-	// e.g. /economy/v2/currency → https://economy.pekora.zip/v2/currency
-	// e.g. /apisite/something   → https://www.pekora.zip/apisite/something
 	parts := strings.SplitN(pathAfterSlash, "/", 2)
 	firstSegment := strings.ToLower(parts[0])
 	remainingPath := ""
@@ -133,26 +122,22 @@ func resolveTargetURL(rawURI string) (string, bool) {
 	}
 
 	if knownSubdomains[firstSegment] {
-		// Known subdomain: use it as subdomain
 		host := firstSegment + "." + baseDomain
 		targetURL := "https://" + host + "/" + remainingPath
 		return targetURL, true
 	}
 
-	// Unknown segment: default to www.pekora.zip with full path
 	targetURL := "https://" + baseHost + "/" + pathAfterSlash
 	return targetURL, true
 }
 
 func requestHandler(ctx *fasthttp.RequestCtx) {
-	// Health check endpoint
 	if string(ctx.Path()) == "/healthz" {
 		ctx.SetStatusCode(200)
 		ctx.SetBody([]byte("ok"))
 		return
 	}
 
-	// Authentication
 	val, ok := os.LookupEnv("KEY")
 	if ok && val != "" && string(ctx.Request.Header.Peek("PROXYKEY")) != val {
 		ctx.SetStatusCode(407)
@@ -160,38 +145,110 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// Build target URL
 	rawURI := string(ctx.Request.Header.RequestURI())
 
 	if rawURI == "/" || rawURI == "" {
-		ctx.Redirect(redirectTarget, fasthttp.StatusFound)
+		ctx.SetStatusCode(200)
+		ctx.SetContentType("text/html; charset=utf-8")
+		ctx.SetBody([]byte(`
+			<!DOCTYPE html>
+			<html lang="en">
+			<head>
+				<meta charset="UTF-8">
+				<title>KoroneProxy</title>
+				<style>
+					body { font-family: system-ui, -apple-system, sans-serif; max-width: 800px; margin: 2rem auto; padding: 0 1rem; }
+					h1 { color: #222; }
+					.example { background: #f0f0f0; padding: 1rem; border-radius: 8px; margin: 1rem 0; }
+					pre { background: #eee; padding: 0.5rem; border-radius: 4px; overflow-x: auto; }
+				</style>
+			</head>
+			<body>
+				<h1>KoroneProxy</h1>
+				<p>Reverse proxy for pekora.zip APIs.</p>
+				<h2>Usage Examples:</h2>
+				<div class="example">
+					<h3>Main site path:</h3>
+					<pre>/apisite/api/alerts/alert-info</pre>
+					<p>→ <code>https://www.pekora.zip/apisite/api/alerts/alert-info</code></p>
+				</div>
+				<div class="example">
+					<h3>Subdomain path:</h3>
+					<pre>/apis/v1/something</pre>
+					<p>→ <code>https://apis.pekora.zip/v1/something</code></p>
+				</div>
+				<div class="example">
+					<h3>Full URL format:</h3>
+					<pre>/https://www.pekora.zip/apisite/api/alerts/alert-info</pre>
+					<p>→ <code>https://www.pekora.zip/apisite/api/alerts/alert-info</code></p>
+				</div>
+				<h2>Supported Methods:</h2>
+				<p>GET, POST, PUT, PATCH, DELETE, OPTIONS, HEAD, etc.</p>
+			</body>
+			</html>
+		`))
 		return
 	}
 
 	targetURL, valid := resolveTargetURL(rawURI)
 	if !valid {
-		ctx.Redirect(redirectTarget, fasthttp.StatusFound)
+		ctx.SetStatusCode(400)
+		ctx.SetContentType("text/html; charset=utf-8")
+		ctx.SetBody([]byte(`
+			<!DOCTYPE html>
+			<html lang="en">
+			<head>
+				<meta charset="UTF-8">
+				<title>400 Bad Request - KoroneProxy</title>
+				<style>
+					body { font-family: system-ui, -apple-system, sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; text-align: center; }
+					h1 { color: #dc2626; }
+				</style>
+			</head>
+			<body>
+				<h1>400 Bad Request</h1>
+				<p>Invalid URL format. Check your request.</p>
+			</body>
+			</html>
+		`))
 		return
 	}
 
-	// Make request with CSRF retry
-	csrfToken := string(ctx.Request.Header.Peek("x-csrf-token"))
-	response := makeRequestWithCSRF(ctx, targetURL, csrfToken, 1)
+	response := makeRequestWithCSRF(ctx, targetURL, string(ctx.Request.Header.Peek("x-csrf-token")), 1)
 	defer fasthttp.ReleaseResponse(response)
 
-	// Handle 404 redirect
 	if response.StatusCode() == 404 {
-		ctx.Redirect(redirectTarget, fasthttp.StatusFound)
+		ctx.SetStatusCode(404)
+		ctx.SetContentType("text/html; charset=utf-8")
+		ctx.SetBody([]byte(`
+			<!DOCTYPE html>
+			<html lang="en">
+			<head>
+				<meta charset="UTF-8">
+				<title>404 Not Found - KoroneProxy</title>
+				<style>
+					body { font-family: system-ui, -apple-system, sans-serif; max-width: 600px; margin: 2rem auto; padding: 0 1rem; text-align: center; }
+					h1 { color: #dc2626; }
+				</style>
+			</head>
+			<body>
+				<h1>404 Not Found</h1>
+				<p>The requested URL was not found on this proxy.</p>
+				<p>Check your URL format and try again.</p>
+			</body>
+			</html>
+		`))
 		return
 	}
 
-	// Copy response back to client
 	ctx.SetStatusCode(response.StatusCode())
+	ctx.SetBody(response.Body())
 
 	response.Header.VisitAll(func(key, value []byte) {
 		keyStr := string(key)
-		switch strings.ToLower(keyStr) {
-		case "transfer-encoding", "connection", "content-length":
+		keyLower := strings.ToLower(keyStr)
+		switch keyLower {
+		case "transfer-encoding", "connection":
 			return
 		}
 		ctx.Response.Header.Set(keyStr, string(value))
@@ -200,8 +257,6 @@ func requestHandler(ctx *fasthttp.RequestCtx) {
 	response.Header.VisitAllCookie(func(key, value []byte) {
 		ctx.Response.Header.AddBytesKV([]byte("Set-Cookie"), value)
 	})
-
-	ctx.SetBody(response.Body())
 }
 
 func makeRequestWithCSRF(ctx *fasthttp.RequestCtx, targetURL string, csrfToken string, attempt int) *fasthttp.Response {
@@ -246,11 +301,6 @@ func makeRequestWithCSRF(ctx *fasthttp.RequestCtx, targetURL string, csrfToken s
 	req.Header.Set("Referer", "https://www.pekora.zip/")
 	req.Header.Set("Origin", "https://www.pekora.zip")
 
-	clientCookie := string(ctx.Request.Header.Peek("Cookie"))
-	if clientCookie != "" {
-		req.Header.Set("Cookie", clientCookie)
-	}
-
 	if csrfToken != "" {
 		req.Header.Set("x-csrf-token", csrfToken)
 	}
@@ -261,28 +311,18 @@ func makeRequestWithCSRF(ctx *fasthttp.RequestCtx, targetURL string, csrfToken s
 
 	resp := fasthttp.AcquireResponse()
 	err = client.Do(req, resp)
-
 	if err != nil {
 		fasthttp.ReleaseResponse(resp)
-		log.Printf("Attempt %d failed for %s: %s", attempt, targetURL, err)
 		return makeRequestWithCSRF(ctx, targetURL, csrfToken, attempt+1)
 	}
 
 	if resp.StatusCode() == 403 {
 		newToken := string(resp.Header.Peek("x-csrf-token"))
 		if newToken != "" && newToken != csrfToken {
-			log.Printf("CSRF token refresh on attempt %d for %s", attempt, targetURL)
 			fasthttp.ReleaseResponse(resp)
 			return makeRequestWithCSRF(ctx, targetURL, newToken, attempt+1)
 		}
 	}
 
 	return resp
-}
-
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	return s[:n]
 }
