@@ -60,9 +60,16 @@ func main() {
 	}
 }
 
-// isPekoraHost checks hostname is pekora.zip or *.pekora.zip
+// isPekoraHost checks hostname is exactly pekora.zip or *.pekora.zip
 func isPekoraHost(h string) bool {
-	h = strings.ToLower(h)
+	// strip port if present e.g. "pekora.zip:443"
+	if idx := strings.Index(h, ":"); idx != -1 {
+		h = h[:idx]
+	}
+	h = strings.ToLower(strings.TrimSpace(h))
+	if h == "" {
+		return false
+	}
 	return h == allowedDomain || strings.HasSuffix(h, "."+allowedDomain)
 }
 
@@ -72,6 +79,8 @@ func resolveTarget(ctx *fasthttp.RequestCtx) (string, bool) {
 	qs := string(ctx.QueryArgs().QueryString())
 
 	// Format 3: subdomain.koroneproxy.up.railway.app/path
+	// e.g. users.koroneproxy.up.railway.app/v1/users/1
+	// → https://users.pekora.zip/v1/users/1
 	if host != "" && strings.HasSuffix(reqHost, "."+host) {
 		subdomain := strings.TrimSuffix(reqHost, "."+host)
 		if subdomain == "" {
@@ -85,6 +94,7 @@ func resolveTarget(ctx *fasthttp.RequestCtx) (string, bool) {
 	}
 
 	// Format 2: /https://www.pekora.zip/apisite/...
+	// → https://www.pekora.zip/apisite/...
 	if strings.HasPrefix(path, "/https://") || strings.HasPrefix(path, "/http://") {
 		raw := strings.TrimPrefix(path, "/")
 		parsed, err := url.Parse(raw)
@@ -104,7 +114,8 @@ func resolveTarget(ctx *fasthttp.RequestCtx) (string, bool) {
 		return target, true
 	}
 
-	// Format 1: /apisite/catalog/v1/... → https://www.pekora.zip/...
+	// Format 1: /apisite/catalog/v1/...
+	// → https://www.pekora.zip/apisite/catalog/v1/...
 	target := baseTarget + path
 	if qs != "" {
 		target += "?" + qs
@@ -132,14 +143,24 @@ func handler(ctx *fasthttp.RequestCtx) {
 		}
 	}
 
-	// resolve target URL
+	// LAYER 1: if path contains an embedded URL, check domain immediately
+	if strings.Contains(path, "://") {
+		raw := strings.TrimPrefix(path, "/")
+		parsed, err := url.Parse(raw)
+		if err != nil || !isPekoraHost(parsed.Host) {
+			jsonError(ctx, 403, "Forbidden: only pekora.zip is allowed")
+			return
+		}
+	}
+
+	// LAYER 2: resolve target URL from any of the 3 formats
 	targetURL, ok := resolveTarget(ctx)
 	if !ok {
 		jsonError(ctx, 403, "Forbidden: only pekora.zip is allowed")
 		return
 	}
 
-	// double check final target is pekora.zip
+	// LAYER 3: final hard check on resolved target
 	parsedTarget, parseErr := url.Parse(targetURL)
 	if parseErr != nil || !isPekoraHost(parsedTarget.Host) {
 		jsonError(ctx, 403, "Forbidden: only pekora.zip is allowed")
@@ -215,6 +236,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 		fmt.Printf("[RESP] %d %s\n", status, targetURL)
 
 		// 403 = CSRF rejected
+		// upstream sends back x-csrf-token header + Set-Cookie: rbxcsrf4=<JWT>
 		if status == 403 {
 			newCSRF := string(resp.Header.Peek("x-csrf-token"))
 			newRbxcsrf4 := findSetCookie(resp, "rbxcsrf4")
@@ -234,7 +256,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 		location := string(resp.Header.Peek("Location"))
 		contentType := string(resp.Header.Peek("Content-Type"))
 
-		// block redirects
+		// block redirects to pekora.zip / roblox.com
 		if status >= 300 && status < 400 {
 			if strings.Contains(location, "pekora.zip") ||
 				strings.Contains(location, "roblox.com") {
@@ -245,7 +267,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 			}
 		}
 
-		// block HTML
+		// block HTML responses
 		if strings.Contains(contentType, "text/html") {
 			fasthttp.ReleaseRequest(req)
 			fasthttp.ReleaseResponse(resp)
@@ -261,9 +283,10 @@ func handler(ctx *fasthttp.RequestCtx) {
 			return
 		}
 
-		// success
+		// success — copy everything back to client
 		ctx.SetStatusCode(status)
 
+		// copy response headers
 		resp.Header.VisitAll(func(k, v []byte) {
 			lo := strings.ToLower(string(k))
 			if lo == "transfer-encoding" ||
@@ -279,7 +302,8 @@ func handler(ctx *fasthttp.RequestCtx) {
 			ctx.Response.Header.Set("x-csrf-token", v)
 		}
 
-		// forward Set-Cookie back to client
+		// forward Set-Cookie headers back to client
+		// VisitAllCookie gives k=name v=value already parsed
 		resp.Header.VisitAllCookie(func(k, v []byte) {
 			ctx.Response.Header.Add("Set-Cookie", string(k)+"="+string(v))
 		})
@@ -291,6 +315,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
+	// all retries failed — never leak internal errors
 	_ = lastErr
 	jsonError(ctx, 502, "Upstream request failed")
 }
@@ -320,6 +345,7 @@ func preflight(targetURL string, cookie string) (csrfToken string, rbxcsrf4 stri
 }
 
 // findSetCookie scans Set-Cookie for a specific cookie name
+// VisitAllCookie gives k=name v=value already split
 func findSetCookie(resp *fasthttp.Response, name string) string {
 	found := ""
 	resp.Header.VisitAllCookie(func(k, v []byte) {
