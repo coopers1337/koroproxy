@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	userAgent  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
-	baseTarget = "https://www.pekora.zip"
+	userAgent     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+	baseTarget    = "https://www.pekora.zip"
 	allowedDomain = "pekora.zip"
 )
 
@@ -60,7 +60,7 @@ func main() {
 	}
 }
 
-// isPekoraHost checks that a hostname is pekora.zip or *.pekora.zip
+// isPekoraHost checks hostname is pekora.zip or *.pekora.zip
 func isPekoraHost(h string) bool {
 	h = strings.ToLower(h)
 	return h == allowedDomain || strings.HasSuffix(h, "."+allowedDomain)
@@ -84,19 +84,17 @@ func resolveTarget(ctx *fasthttp.RequestCtx) (string, bool) {
 		return target, true
 	}
 
-	// Format 2: /https://www.pekora.zip/apisite/... or /http://...
+	// Format 2: /https://www.pekora.zip/apisite/...
 	if strings.HasPrefix(path, "/https://") || strings.HasPrefix(path, "/http://") {
 		raw := strings.TrimPrefix(path, "/")
 		parsed, err := url.Parse(raw)
 		if err != nil {
 			return "", false
 		}
-
-		// MUST be pekora.zip domain only
+		// block non pekora.zip domains
 		if !isPekoraHost(parsed.Host) {
 			return "", false
 		}
-
 		target := parsed.Scheme + "://" + parsed.Host + parsed.Path
 		if qs != "" {
 			target += "?" + qs
@@ -106,7 +104,7 @@ func resolveTarget(ctx *fasthttp.RequestCtx) (string, bool) {
 		return target, true
 	}
 
-	// Format 1: /apisite/catalog/v1/... → https://www.pekora.zip/apisite/...
+	// Format 1: /apisite/catalog/v1/... → https://www.pekora.zip/...
 	target := baseTarget + path
 	if qs != "" {
 		target += "?" + qs
@@ -137,14 +135,13 @@ func handler(ctx *fasthttp.RequestCtx) {
 	// resolve target URL
 	targetURL, ok := resolveTarget(ctx)
 	if !ok {
-		// bad domain or invalid URL
 		jsonError(ctx, 403, "Forbidden: only pekora.zip is allowed")
 		return
 	}
 
 	// double check final target is pekora.zip
-	parsed, err := url.Parse(targetURL)
-	if err != nil || !isPekoraHost(parsed.Host) {
+	parsedTarget, parseErr := url.Parse(targetURL)
+	if parseErr != nil || !isPekoraHost(parsedTarget.Host) {
 		jsonError(ctx, 403, "Forbidden: only pekora.zip is allowed")
 		return
 	}
@@ -174,7 +171,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 		req.SetRequestURI(targetURL)
 		req.Header.SetMethod(string(ctx.Method()))
 		req.Header.Set("User-Agent", userAgent)
-		req.Header.Set("Host", parsed.Host)
+		req.Header.Set("Host", parsedTarget.Host)
 
 		// copy client headers — skip ones we manage manually
 		ctx.Request.Header.VisitAll(func(k, v []byte) {
@@ -205,10 +202,10 @@ func handler(ctx *fasthttp.RequestCtx) {
 			req.SetBody(body)
 		}
 
-		err = client.DoTimeout(req, resp, timeout)
-		if err != nil {
-			lastErr = err
-			fmt.Printf("[ERROR] attempt %d: %s → %s\n", i+1, targetURL, err.Error())
+		doErr := client.DoTimeout(req, resp, timeout)
+		if doErr != nil {
+			lastErr = doErr
+			fmt.Printf("[ERROR] attempt %d: %s → %s\n", i+1, targetURL, doErr.Error())
 			fasthttp.ReleaseRequest(req)
 			fasthttp.ReleaseResponse(resp)
 			continue
@@ -237,7 +234,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 		location := string(resp.Header.Peek("Location"))
 		contentType := string(resp.Header.Peek("Content-Type"))
 
-		// block redirects to pekora.zip / roblox.com
+		// block redirects
 		if status >= 300 && status < 400 {
 			if strings.Contains(location, "pekora.zip") ||
 				strings.Contains(location, "roblox.com") {
@@ -267,7 +264,6 @@ func handler(ctx *fasthttp.RequestCtx) {
 		// success
 		ctx.SetStatusCode(status)
 
-		// copy response headers
 		resp.Header.VisitAll(func(k, v []byte) {
 			lo := strings.ToLower(string(k))
 			if lo == "transfer-encoding" ||
@@ -283,7 +279,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 			ctx.Response.Header.Set("x-csrf-token", v)
 		}
 
-		// forward Set-Cookie headers back to client
+		// forward Set-Cookie back to client
 		resp.Header.VisitAllCookie(func(k, v []byte) {
 			ctx.Response.Header.Add("Set-Cookie", string(k)+"="+string(v))
 		})
@@ -295,7 +291,7 @@ func handler(ctx *fasthttp.RequestCtx) {
 		return
 	}
 
-	// all retries failed — hide internal error details
+	_ = lastErr
 	jsonError(ctx, 502, "Upstream request failed")
 }
 
@@ -339,7 +335,6 @@ func mergeCookies(existing string, name string, value string) string {
 	if value == "" {
 		return existing
 	}
-
 	var parts []string
 	if existing != "" {
 		for _, part := range strings.Split(existing, ";") {
@@ -353,7 +348,6 @@ func mergeCookies(existing string, name string, value string) string {
 			parts = append(parts, trimmed)
 		}
 	}
-
 	parts = append(parts, name+"="+value)
 	return strings.Join(parts, "; ")
 }
